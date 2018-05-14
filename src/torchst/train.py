@@ -8,25 +8,27 @@ import multiprocessing.pool as mp
 import torch
 import torch.optim as O
 import tqdm
+from tensorboardX import SummaryWriter
 from torch.autograd import Variable
 from torch.nn.parallel import data_parallel
-from torch.nn.utils import clip_grad_norm
+from torch.nn.utils import clip_grad_norm_
 from torchtextutils import Vocabulary
 from torchtextutils import BatchPreprocessor
 from torchtextutils import DirectoryReader
 from torchtextutils import OmissionNoisifier
 from torchtextutils import SwapNoisifier
 from torchtextutils import create_generator_st
+from visdom import Visdom
 from yaap import ArgParser
 from yaap import path
 from configargparse import YAMLConfigFileParser
 
-from .model import MultiContextSkipThoughts
-from .model import compute_loss
-from .wordembed import load_embeddings_mp
-from .wordembed import load_embeddings
-from .wordembed import load_fasttext_embeddings
-from .wordembed import preinitialize_embeddings
+from model import  MultiContextSkipThoughts
+from model import compute_loss
+from wordembed import load_embeddings_mp
+from wordembed import load_embeddings
+from wordembed import load_fasttext_embeddings
+from wordembed import preinitialize_embeddings
 
 
 def parse_args():
@@ -46,7 +48,7 @@ def parse_args():
                     "it is impossible to operate without batch-first data")
     parser.add("--visualizer", type=str, default=None,
                choices=["visdom", "tensorboard"])
-    parser.add("--ckpt-name", type=str, default="model-e{epoch}-s{iter}-{loss}")
+    parser.add("--ckpt-name", type=str, default="model-e{epoch}-s{step}-{loss}")
     parser.add("-v", "--verbose", action="store_true", default=False)
 
     group = parser.add_group("Word Embedding Options")
@@ -61,8 +63,8 @@ def parse_args():
     group = parser.add_group("Training Options")
     group.add("--epochs", type=int, default=3)
     group.add("--batch-size", type=int, default=32)
-    group.add("--omit-prob", type=float, default=0.05)
-    group.add("--swap-prob", type=float, default=0.05)
+    group.add("--omit-prob", type=float, default=0.0)
+    group.add("--swap-prob", type=float, default=0.0)
     group.add("--val-period", type=int, default=100)
     group.add("--save-period", type=int, default=1000)
     group.add("--max-len", type=int, default=30)
@@ -144,6 +146,7 @@ class DataGenerator(object):
         for in_data, in_lens, out_data, out_lens in data_generator:
             for nosifier in noisifiers:
                 # in-place noisification
+                print(in_data, in_lens)
                 nosifier((in_data, in_lens))
 
             yield in_data, in_lens, out_data, out_lens
@@ -166,6 +169,14 @@ class Trainer(object):
         self.batch_first = batch_first
         self.legend = ["average"] + ["decoder_{}".format(i)
                                      for i in range(self.model.n_decoders)]
+
+        # todo code to load saved model dict
+        print('Loading model...')
+        # pkl.dump(model_options, open('%s_params_%s.pkl' % (saveto, encoder), 'wb'))
+        self.model.load_state_dict(torch.load('/var/tmp/save/20180508-19-5410-skipthoughts/model-e01-s0619000-2.9422'))
+        #self.model.load_state_dict(torch.load('saver1/20180506-13-0348-skipthoughts/model-e04-s0024000-3.0225'))
+
+        print('Done')
 
         if gpu_devices:
             self.model = model.cuda()
@@ -215,7 +226,8 @@ class Trainer(object):
             xys_idx = xys_idx.transpose(0, 2, 1)
 
         data = [x, x_lens, ys_i, ys_t, ys_lens, xys_idx]
-        x, x_lens, ys_i, ys_t, ys_lens, xys_idx = [torch.cat(d) for d in data]
+        #print(data)
+        x, x_lens, ys_i, ys_t, ys_lens, xys_idx = [torch.cat([Variable(e.data) for e in d]) for d in data]
 
         if not self.batch_first:
             ys_i = ys_i.transpose(1, 0)
@@ -228,7 +240,7 @@ class Trainer(object):
 
         return data
 
-    def prepare_batch(self, batch_data, volatile=False):
+    def prepare_batch(self, batch_data):
         x, x_lens, ys, ys_lens = batch_data
         batch_dim = 0 if self.batch_first else 1
         context_dim = 1 if self.batch_first else 0
@@ -243,12 +255,12 @@ class Trainer(object):
         x = x[x_idx]
         ys = torch.gather(ys, batch_dim, ys_idx.unsqueeze(-1).expand_as(ys))
 
-        x = Variable(x, volatile=volatile)
-        x_lens = Variable(x_lens, volatile=volatile)
-        ys_i = Variable(ys[..., :-1], volatile=volatile).contiguous()
-        ys_t = Variable(ys[..., 1:], volatile=volatile).contiguous()
-        ys_lens = Variable(ys_lens - 1, volatile=volatile)
-        xys_idx = Variable(xys_idx, volatile=volatile)
+        x = Variable(x)
+        x_lens = Variable(x_lens)
+        ys_i = Variable(ys[..., :-1]).contiguous()
+        ys_t = Variable(ys[..., 1:]).contiguous()
+        ys_lens = Variable(ys_lens - 1)
+        xys_idx = Variable(xys_idx)
 
         if self.is_cuda:
             x = x.cuda(async=True)
@@ -347,21 +359,26 @@ class Trainer(object):
                              dim=0,
                              module_kwargs=None)
 
-    def step(self, step, batch_data, volatile=True, title=None):
-        processed_data = self.prepare_batches(batch_data,
+    def step(self, step, batch_data,  title=None):
+        if len(self.gpu_devices) > 0:
+            processed_data = self.prepare_batches(batch_data,
                                               chunks=len(self.gpu_devices),
-                                              volatile=volatile)
-        x, x_lens, ys_i, ys_t, ys_lens, xys_idx = processed_data
-        inputs = (x, x_lens, ys_i, ys_lens, xys_idx)
-        dec_logits, h = self.forward(inputs)
-        merged_data = self.merge_batches(processed_data)
-        losses_batch, losses_step = self.calculate_loss(merged_data, dec_logits)
-        losses_step_val = [l.data[0] for l in losses_step]
+                                              )
+            x, x_lens, ys_i, ys_t, ys_lens, xys_idx = processed_data
+            inputs = (x, x_lens, ys_i, ys_lens, xys_idx)
+            dec_logits, h = self.forward(inputs)
+            merged_data = self.merge_batches(processed_data)
+            losses_batch, losses_step = self.calculate_loss(merged_data, dec_logits)
+        else:
+            merged_data = batch_data
+            dec_logits, h = self.forward(merged_data)
+            losses_batch, losses_step = self.calculate_loss(merged_data, dec_logits)
+        losses_step_val = [l.data.item() for l in losses_step]
         loss_step = (sum(losses_step) / len(losses_step))
         loss_batch = sum(losses_batch) / len(losses_batch)
 
         plot_X = [step] * (self.model.n_decoders + 1)
-        plot_Y = [loss_step.data[0]] + losses_step_val
+        plot_Y = [loss_step.data.item()] + losses_step_val
 
         self.logger.add_loss(title, **{
             t: p for t, p in zip(self.legend, plot_Y)
@@ -370,19 +387,18 @@ class Trainer(object):
         return merged_data, dec_logits, loss_batch, loss_step
 
     def step_val(self, step, batch_data):
-        data, dec_logits, loss_b, loss_s = self.step(step, batch_data,
-                                                     volatile=True,
-                                                     title="Validation Loss")
-        sents = self.val_sents(data, dec_logits)
-        text = self.val_text(*sents)
+        with torch.no_grad():
+            data, dec_logits, loss_b, loss_s = self.step(step, batch_data,
+                                                         title="Validation Loss")
+            sents = self.val_sents(data, dec_logits)
+            text = self.val_text(*sents)
 
-        self.logger.add_text("Validation Examples", text)
+            self.logger.add_text("Validation Examples", text)
 
-        return loss_b, loss_s
+            return loss_b, loss_s
 
     def step_train(self, step, batch_data):
         data, dec_logits, loss_b, loss_s = self.step(step, batch_data,
-                                                     volatile=False,
                                                      title="Training Loss")
 
         return loss_b, loss_s
@@ -394,7 +410,7 @@ class Trainer(object):
 
     def train(self):
         optimizer = O.Adam([p for p in self.model.parameters()
-                            if p.requires_grad])
+                            if p.requires_grad],  amsgrad=True)
         step = 0
         t = tqdm.tqdm()
 
@@ -410,10 +426,10 @@ class Trainer(object):
                     loss_b, loss_s = self.step_train(step, data)
 
                     loss_b.backward()
-                    clip_grad_norm(self.model.parameters(), 10)
+                    clip_grad_norm_(self.model.parameters(), 10)
                     optimizer.step()
 
-                loss_val = loss_s.data[0]
+                loss_val = loss_s.data.item()
 
                 if step % self.save_period == 0:
                     filename = self.ckpt_format.format(
@@ -584,7 +600,7 @@ def main():
     with open(args.vocab_path, "rb") as f:
         vocab = pickle.load(f)
 
-    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H-%M%S")
     save_basename = timestamp + "-{}".format(args.name)
     save_dir = os.path.join(args.save_dir, save_basename)
 
@@ -644,7 +660,7 @@ def main():
     if args.visualizer is None:
         logger = DummyTrainLogger()
     elif args.visualizer == "tensorboard":
-        from tensorboard import SummaryWriter
+        from tensorboardX import SummaryWriter
         logger = TensorboardTrainLogger(save_dir)
     elif args.visualizer == "visdom":
         from visdom_pooled import Visdom
