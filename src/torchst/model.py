@@ -5,7 +5,7 @@ import torch.nn.utils.rnn as R
 import torch.nn.functional as F
 from torch.autograd import Variable
 
-from torchsru import SRU
+#from torchsru import SRU
 
 
 def pad_batch(x, n, after=True):
@@ -24,7 +24,7 @@ def init_gru(cell, gain=1):
     # orthogonal initialization of recurrent weights
     for _, hh, _, _ in cell.all_weights:
         for i in range(0, hh.size(0), cell.hidden_size):
-            I.orthogonal(hh[i:i + cell.hidden_size], gain=gain)
+            I.orthogonal_(hh[i:i + cell.hidden_size], gain=gain)
 
 
 def init_lstm(cell, gain=1):
@@ -138,8 +138,8 @@ class MultiContextSkipThoughts(nn.Module):
             cell_cls = nn.LSTM
         elif rnn_cell == "gru":
             cell_cls = nn.GRU
-        elif rnn_cell == "sru":
-            cell_cls = SRU
+        # elif rnn_cell == "sru":
+        #     cell_cls = SRU
         else:
             raise ValueError("Unrecognized rnn cell: {}".format(rnn_cell))
 
@@ -243,9 +243,9 @@ class MultiContextSkipThoughts(nn.Module):
         return ret
 
     def reset_parameters(self):
-        I.normal(self.embeddings.weight.data, mean=0, std=0.01)
-        I.xavier_normal(self.W_i.weight.data)
-        I.xavier_normal(self.W_o.weight.data)
+        I.normal_(self.embeddings.weight.data, mean=0, std=0.01)
+        I.xavier_normal_(self.W_i.weight.data)
+        I.xavier_normal_(self.W_o.weight.data)
 
         init_rnn_cell(self.encoder)
 
@@ -442,8 +442,9 @@ def compute_loss(logits, y, lens):
     batch_size, seq_len, vocab_size = logits.size()
     logits = logits.view(batch_size * seq_len, vocab_size)
     y = y.view(-1)
+    #print(logits, logits.shape, y.shape)
 
-    logprobs = F.log_softmax(logits)
+    logprobs = F.log_softmax(logits, dim=0)
     losses = -torch.gather(logprobs, 1, y.unsqueeze(-1))
     losses = losses.view(batch_size, seq_len)
     mask = sequence_mask(lens, seq_len).float()
