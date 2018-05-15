@@ -6,6 +6,9 @@ __pycache__/
 # C extensions
 *.so
 
+#datafiles
+src/torcchst/saver
+src/torcchst/saver1
 # Distribution / packaging
 .Python
 env/
